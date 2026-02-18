@@ -4,7 +4,6 @@ const {
   processClient,
   parseInputRowsFromUpload,
   processCsvBatch,
-  saveResultsFile,
   InputFileValidationError,
 } = require("./processor");
 const { consumeConsultDay, DEFAULT_TOTAL_LIMIT, ConsultDayLimitError } = require("./consultDayRepo");
@@ -77,9 +76,8 @@ app.post("/api/process/individual", async (req, res) => {
       loginP: loginValue,
       tipoConsulta: "Individual",
     });
-    const outputFile = saveResultsFile([result]);
     finishJob(jobId);
-    return res.json({ ok: result.final_status === "OK", jobId, outputFile, consultDay, persisted, result });
+    return res.json({ ok: result.final_status === "OK", jobId, consultDay, persisted, result });
   } catch (err) {
     if (jobId) finishJob(jobId, { errorMessage: String(err.message || err) });
     return res.status(500).json({ ok: false, error: String(err.message || err) });
@@ -136,7 +134,6 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
         persisted: { insertedRows: 0, skippedRows: 0 },
         skippedDuplicatedInFile,
         skippedDuplicatedToday,
-        outputFile: null,
         results: [],
         message: "Nenhum registro para processar. Todos os CPFs ja foram consultados hoje para este login.",
       });
@@ -177,7 +174,6 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       loginP: loginValue,
       tipoConsulta: "Em lote",
     });
-    const outputFile = saveResultsFile(results);
     const okCount = results.filter((r) => r.final_status === "OK").length;
     finishJob(jobId);
     return res.json({
@@ -190,7 +186,6 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       persisted,
       skippedDuplicatedInFile,
       skippedDuplicatedToday,
-      outputFile,
       results,
     });
   } catch (err) {
