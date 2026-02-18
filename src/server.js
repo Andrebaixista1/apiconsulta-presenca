@@ -9,6 +9,7 @@ const {
 } = require("./processor");
 const { consumeConsultDay, DEFAULT_TOTAL_LIMIT, ConsultDayLimitError } = require("./consultDayRepo");
 const { saveConsultaPresencaResults, getConsultedCpfsTodayByLogin } = require("./consultaPresencaRepo");
+const { createJob, markProgress, markSkipped, finishJob, getJob, getCurrentJob } = require("./statusTracker");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -22,7 +23,24 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "api-presenca-node" });
 });
 
+app.get("/api/status/current", (_req, res) => {
+  const status = getCurrentJob();
+  if (!status) {
+    return res.status(404).json({ ok: false, error: "Nenhum processamento encontrado." });
+  }
+  return res.json({ ok: true, status });
+});
+
+app.get("/api/status/:jobId", (req, res) => {
+  const status = getJob(req.params.jobId);
+  if (!status) {
+    return res.status(404).json({ ok: false, error: "jobId nao encontrado." });
+  }
+  return res.json({ ok: true, status });
+});
+
 app.post("/api/process/individual", async (req, res) => {
+  let jobId = null;
   try {
     const { cpf, nome, telefone, produtoId, autoAcceptHeadless = true, stepDelayMs, login, senha } = req.body || {};
     if (!cpf || !nome || !telefone) {
@@ -30,6 +48,7 @@ app.post("/api/process/individual", async (req, res) => {
     }
     const loginValue = String(login || DEFAULT_PRESENCA_LOGIN);
     const senhaValue = String(senha || DEFAULT_PRESENCA_SENHA);
+    jobId = createJob({ type: "individual", total: 1 });
     let consultDay;
     try {
       consultDay = await consumeConsultDay({
@@ -40,6 +59,7 @@ app.post("/api/process/individual", async (req, res) => {
       });
     } catch (err) {
       if (err instanceof ConsultDayLimitError) {
+        if (jobId) finishJob(jobId, { errorMessage: err.message });
         return res.status(403).json({
           ok: false,
           error: err.message,
@@ -52,18 +72,22 @@ app.post("/api/process/individual", async (req, res) => {
       { cpf, nome, telefone },
       { produtoId, autoAcceptHeadless, stepDelayMs, login: loginValue, senha: senhaValue }
     );
+    markProgress(jobId, { ok: result.final_status === "OK", errorMessage: result.final_message });
     const persisted = await saveConsultaPresencaResults([result], {
       loginP: loginValue,
       tipoConsulta: "Individual",
     });
     const outputFile = saveResultsFile([result]);
-    return res.json({ ok: result.final_status === "OK", outputFile, consultDay, persisted, result });
+    finishJob(jobId);
+    return res.json({ ok: result.final_status === "OK", jobId, outputFile, consultDay, persisted, result });
   } catch (err) {
+    if (jobId) finishJob(jobId, { errorMessage: String(err.message || err) });
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
 
 app.post("/api/process/csv", upload.single("file"), async (req, res) => {
+  let jobId = null;
   try {
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "Envie um arquivo CSV (;) ou XLSX no campo file" });
@@ -97,10 +121,14 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
     const consultedToday = await getConsultedCpfsTodayByLogin(loginValue, cpfsToCheck);
     const rowsToProcess = uniqueRows.filter((r) => !r.cpf || !consultedToday.has(r.cpf));
     const skippedDuplicatedToday = uniqueRows.length - rowsToProcess.length;
+    jobId = createJob({ type: "lote", total: rowsToProcess.length });
+    markSkipped(jobId, skippedDuplicatedInFile + skippedDuplicatedToday);
 
     if (!rowsToProcess.length) {
+      finishJob(jobId);
       return res.json({
         ok: true,
+        jobId,
         total: 0,
         okCount: 0,
         erroCount: 0,
@@ -125,6 +153,7 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       });
     } catch (err) {
       if (err instanceof ConsultDayLimitError) {
+        if (jobId) finishJob(jobId, { errorMessage: err.message });
         return res.status(403).json({
           ok: false,
           error: err.message,
@@ -140,6 +169,9 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       stepDelayMs: stepDelayMs != null ? Number(stepDelayMs) : undefined,
       login: loginValue,
       senha: senhaValue,
+      onItemProcessed: async (item) => {
+        markProgress(jobId, { ok: item.final_status === "OK", errorMessage: item.final_message });
+      },
     });
     const persisted = await saveConsultaPresencaResults(results, {
       loginP: loginValue,
@@ -147,8 +179,10 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
     });
     const outputFile = saveResultsFile(results);
     const okCount = results.filter((r) => r.final_status === "OK").length;
+    finishJob(jobId);
     return res.json({
       ok: true,
+      jobId,
       total: results.length,
       okCount,
       erroCount: results.length - okCount,
@@ -160,6 +194,7 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       results,
     });
   } catch (err) {
+    if (jobId) finishJob(jobId, { errorMessage: String(err.message || err) });
     if (err instanceof InputFileValidationError) {
       return res.status(400).json({ ok: false, error: err.message });
     }

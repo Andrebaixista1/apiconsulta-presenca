@@ -322,9 +322,18 @@ async function processCsvBatch(rows, opts = {}) {
     selected = [...rows].sort(() => Math.random() - 0.5).slice(0, randomRows);
   }
   const results = [];
-  for (const row of selected) {
+  for (let i = 0; i < selected.length; i += 1) {
+    const row = selected[i];
+    const startedAt = Date.now();
     const r = await processClient(row, opts);
     results.push(r);
+    if (typeof opts.onItemProcessed === "function") {
+      await opts.onItemProcessed(r, {
+        index: i,
+        total: selected.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+    }
   }
   return results;
 }
