@@ -124,6 +124,37 @@ async function saveConsultaPresencaResults(results, { loginP, tipoConsulta }) {
   return { insertedRows, skippedRows };
 }
 
+async function getConsultedCpfsTodayByLogin(loginP, cpfs) {
+  const normalized = [...new Set((cpfs || []).map((v) => onlyDigits(v)).filter(Boolean))];
+  if (!loginP || !normalized.length) return new Set();
+
+  const pool = await getPool();
+  const req = pool.request();
+  req.input("loginP", sql.VarChar(50), String(loginP));
+
+  const placeholders = normalized.map((cpf, idx) => {
+    const name = `cpf${idx}`;
+    req.input(name, sql.BigInt, cpf);
+    return `@${name}`;
+  });
+
+  const rs = await req.query(`
+    SELECT DISTINCT CAST([cpf] AS VARCHAR(20)) AS cpf
+    FROM [presenca].[dbo].[consulta_presenca]
+    WHERE [loginP] = @loginP
+      AND CAST([created_at] AS DATE) = CAST(GETDATE() AS DATE)
+      AND [cpf] IN (${placeholders.join(", ")})
+  `);
+
+  const found = new Set();
+  for (const row of rs.recordset || []) {
+    const d = onlyDigits(row.cpf);
+    if (d) found.add(d.padStart(11, "0"));
+  }
+  return found;
+}
+
 module.exports = {
   saveConsultaPresencaResults,
+  getConsultedCpfsTodayByLogin,
 };

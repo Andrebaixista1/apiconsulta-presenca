@@ -14,6 +14,7 @@ const {
 const DEFAULT_LOGIN = process.env.PRESENCA_LOGIN || "40138573832_HDSL";
 const DEFAULT_SENHA = process.env.PRESENCA_SENHA || "Presenca@1516";
 const DEFAULT_STEP_DELAY_MS = Number(process.env.PRESENCA_STEP_DELAY_MS || 2000);
+const REQUIRED_FILE_COLUMNS = ["CPF", "NOME", "TELEFONE"];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -56,6 +57,93 @@ function flattenApi5(result) {
     }));
   }
   return [{ ...base }];
+}
+
+class InputFileValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "InputFileValidationError";
+    this.code = "INPUT_FILE_VALIDATION_ERROR";
+  }
+}
+
+const normalizeHeader = (value) =>
+  String(value ?? "")
+    .replace(/^\uFEFF/, "")
+    .trim()
+    .toUpperCase();
+
+function assertRequiredColumns(headers) {
+  const normalized = new Set((headers || []).map((h) => normalizeHeader(h)));
+  const missing = REQUIRED_FILE_COLUMNS.filter((col) => !normalized.has(col));
+  if (missing.length > 0) {
+    throw new InputFileValidationError(
+      `Arquivo invalido. As colunas obrigatorias sao: ${REQUIRED_FILE_COLUMNS.join(", ")}. Faltando: ${missing.join(", ")}`
+    );
+  }
+}
+
+function mapToClientRows(rawRows) {
+  return rawRows.map((row) => {
+    const normalized = {};
+    Object.keys(row || {}).forEach((k) => {
+      normalized[normalizeHeader(k)] = row[k];
+    });
+    return {
+      cpf: normalizeCpf(normalized.CPF || ""),
+      nome: normalizeNome(normalized.NOME || ""),
+      telefone: normalizeTelefone(normalized.TELEFONE || ""),
+    };
+  });
+}
+
+function parseCsvSemicolon(buffer) {
+  const text = buffer.toString("utf8");
+  const firstHeaderLine = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!firstHeaderLine) return [];
+  assertRequiredColumns(firstHeaderLine.split(";"));
+
+  const rows = parse(text, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    delimiter: ";",
+    bom: true,
+  });
+  return mapToClientRows(rows);
+}
+
+function parseXlsx(buffer) {
+  const wb = XLSX.read(buffer, { type: "buffer" });
+  const firstSheetName = wb.SheetNames[0];
+  if (!firstSheetName) return [];
+  const ws = wb.Sheets[firstSheetName];
+
+  const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+  const headers = Array.isArray(matrix[0]) ? matrix[0] : [];
+  assertRequiredColumns(headers);
+
+  const rows = XLSX.utils.sheet_to_json(ws, { raw: false, defval: "" });
+  return mapToClientRows(rows);
+}
+
+function parseInputRowsFromUpload(file) {
+  const originalName = String(file?.originalname || "").toLowerCase();
+  const isCsv = originalName.endsWith(".csv");
+  const isXlsx = originalName.endsWith(".xlsx");
+  if (!isCsv && !isXlsx) {
+    throw new InputFileValidationError(
+      "Formato de arquivo invalido. Envie .csv (separado por ;) ou .xlsx com colunas CPF, NOME e TELEFONE."
+    );
+  }
+  const rows = isCsv ? parseCsvSemicolon(file.buffer) : parseXlsx(file.buffer);
+  if (!rows.length) {
+    throw new InputFileValidationError("Arquivo vazio ou sem registros validos.");
+  }
+  return rows;
 }
 
 async function processClient(input, opts = {}) {
@@ -199,21 +287,6 @@ async function processClient(input, opts = {}) {
   return result;
 }
 
-function parseCsvBuffer(buffer) {
-  const rows = parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
-  return rows.map((r) => {
-    const normalized = {};
-    Object.keys(r).forEach((k) => {
-      normalized[k.toUpperCase()] = r[k];
-    });
-    return {
-      cpf: normalized.CPF || "",
-      nome: normalized.NOME || "",
-      telefone: normalized.TELEFONE || "",
-    };
-  });
-}
-
 function saveResultsFile(results, outputName) {
   const outDir = ensureOutputsDir();
   const fileName = outputName || `resultado_presenca_${nowFileStamp()}.xlsx`;
@@ -258,7 +331,8 @@ async function processCsvBatch(rows, opts = {}) {
 
 module.exports = {
   processClient,
-  parseCsvBuffer,
+  parseInputRowsFromUpload,
   processCsvBatch,
   saveResultsFile,
+  InputFileValidationError,
 };

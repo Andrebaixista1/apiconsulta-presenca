@@ -1,8 +1,14 @@
 const express = require("express");
 const multer = require("multer");
-const { processClient, parseCsvBuffer, processCsvBatch, saveResultsFile } = require("./processor");
+const {
+  processClient,
+  parseInputRowsFromUpload,
+  processCsvBatch,
+  saveResultsFile,
+  InputFileValidationError,
+} = require("./processor");
 const { consumeConsultDay, DEFAULT_TOTAL_LIMIT, ConsultDayLimitError } = require("./consultDayRepo");
-const { saveConsultaPresencaResults } = require("./consultaPresencaRepo");
+const { saveConsultaPresencaResults, getConsultedCpfsTodayByLogin } = require("./consultaPresencaRepo");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -60,23 +66,55 @@ app.post("/api/process/individual", async (req, res) => {
 app.post("/api/process/csv", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ ok: false, error: "Envie um CSV no campo file" });
+      return res.status(400).json({ ok: false, error: "Envie um arquivo CSV (;) ou XLSX no campo file" });
     }
     const { randomRows = 0, produtoId, autoAcceptHeadless = "true", stepDelayMs, login, senha } = req.body || {};
     const loginValue = String(login || DEFAULT_PRESENCA_LOGIN);
     const senhaValue = String(senha || DEFAULT_PRESENCA_SENHA);
-    const rows = parseCsvBuffer(req.file.buffer);
-    if (!rows.length) {
-      return res.status(400).json({ ok: false, error: "CSV vazio ou sem colunas CPF,NOME,TELEFONE" });
-    }
+    const rows = parseInputRowsFromUpload(req.file);
     if (rows.length > MAX_CSV_ROWS) {
       return res.status(400).json({
         ok: false,
-        error: `Arquivo CSV possui ${rows.length} registros. O limite maximo e ${MAX_CSV_ROWS}.`,
+        error: `Arquivo possui ${rows.length} registros. O limite maximo e ${MAX_CSV_ROWS}.`,
       });
     }
     const randomRowsNum = Number(randomRows || 0);
-    const usedDelta = randomRowsNum > 0 ? Math.min(rows.length, randomRowsNum) : rows.length;
+    let selectedRows = rows;
+    if (randomRowsNum > 0 && rows.length > randomRowsNum) {
+      selectedRows = [...rows].sort(() => Math.random() - 0.5).slice(0, randomRowsNum);
+    }
+
+    const seenInFile = new Set();
+    const uniqueRows = selectedRows.filter((row) => {
+      if (!row.cpf) return true;
+      if (seenInFile.has(row.cpf)) return false;
+      seenInFile.add(row.cpf);
+      return true;
+    });
+    const skippedDuplicatedInFile = selectedRows.length - uniqueRows.length;
+
+    const cpfsToCheck = uniqueRows.map((r) => r.cpf).filter(Boolean);
+    const consultedToday = await getConsultedCpfsTodayByLogin(loginValue, cpfsToCheck);
+    const rowsToProcess = uniqueRows.filter((r) => !r.cpf || !consultedToday.has(r.cpf));
+    const skippedDuplicatedToday = uniqueRows.length - rowsToProcess.length;
+
+    if (!rowsToProcess.length) {
+      return res.json({
+        ok: true,
+        total: 0,
+        okCount: 0,
+        erroCount: 0,
+        consultDay: null,
+        persisted: { insertedRows: 0, skippedRows: 0 },
+        skippedDuplicatedInFile,
+        skippedDuplicatedToday,
+        outputFile: null,
+        results: [],
+        message: "Nenhum registro para processar. Todos os CPFs ja foram consultados hoje para este login.",
+      });
+    }
+
+    const usedDelta = rowsToProcess.length;
     let consultDay;
     try {
       consultDay = await consumeConsultDay({
@@ -95,8 +133,8 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       }
       throw err;
     }
-    const results = await processCsvBatch(rows, {
-      randomRows: randomRowsNum,
+    const results = await processCsvBatch(rowsToProcess, {
+      randomRows: 0,
       produtoId: produtoId ? Number(produtoId) : 28,
       autoAcceptHeadless: String(autoAcceptHeadless).toLowerCase() !== "false",
       stepDelayMs: stepDelayMs != null ? Number(stepDelayMs) : undefined,
@@ -116,10 +154,15 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       erroCount: results.length - okCount,
       consultDay,
       persisted,
+      skippedDuplicatedInFile,
+      skippedDuplicatedToday,
       outputFile,
       results,
     });
   } catch (err) {
+    if (err instanceof InputFileValidationError) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
