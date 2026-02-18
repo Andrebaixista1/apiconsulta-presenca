@@ -1,0 +1,14 @@
+node_modules/
+outputs/
+.env
+.env.*
+AGENTS.md
+*.xlsx
+*.xls
+*.csv
+*.png
+*.py
+__pycache__/
+*.pyc
+npm-debug.log*
+.DS_Store
