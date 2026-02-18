@@ -7,7 +7,7 @@ const {
   InputFileValidationError,
 } = require("./processor");
 const { consumeConsultDay, DEFAULT_TOTAL_LIMIT, ConsultDayLimitError } = require("./consultDayRepo");
-const { saveConsultaPresencaResults, getConsultedCpfsTodayByLogin } = require("./consultaPresencaRepo");
+const { saveConsultaPresencaResults, insertPendingConsultaPresenca, getConsultedCpfsTodayByLogin } = require("./consultaPresencaRepo");
 const { createJob, markProgress, markSkipped, finishJob, getJob, getCurrentJob } = require("./statusTracker");
 
 const app = express();
@@ -139,6 +139,20 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
       });
     }
 
+    const fileNameValue = String(req.body?.fileName || req.file?.originalname || "Arquivo em lote").trim();
+    const createdAt = new Date();
+    await insertPendingConsultaPresenca(
+      rowsToProcess.map((row) => ({
+        cpf: row.cpf,
+        nome: row.nome,
+        telefone: row.telefone,
+      })),
+      {
+        loginP: loginValue,
+        tipoConsulta: fileNameValue,
+        createdAt,
+      }
+    );
     const usedDelta = rowsToProcess.length;
     let consultDay;
     try {
@@ -172,7 +186,9 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
     });
     const persisted = await saveConsultaPresencaResults(results, {
       loginP: loginValue,
-      tipoConsulta: "Em lote",
+      tipoConsulta: fileNameValue,
+      createdAt,
+      status: "Concluido",
     });
     const okCount = results.filter((r) => r.final_status === "OK").length;
     finishJob(jobId);

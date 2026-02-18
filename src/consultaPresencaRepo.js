@@ -60,7 +60,7 @@ function buildRowsFromResult(result, loginP, tipoConsulta) {
   }));
 }
 
-async function insertConsultaPresencaRows(rows) {
+async function insertConsultaPresencaRows(rows, options = {}) {
   if (!rows.length) return 0;
   const pool = await getPool();
   const tx = new sql.Transaction(pool);
@@ -73,7 +73,8 @@ async function insertConsultaPresencaRows(rows) {
       req.input("cpf", sql.BigInt, row.cpf);
       req.input("nome", sql.VarChar(100), row.nome);
       req.input("telefone", sql.BigInt, row.telefone);
-      req.input("loginP", sql.VarChar(50), row.loginP);
+      const loginPValue = toVarcharOrNull(options.loginP, 50);
+      req.input("loginP", sql.VarChar(50), loginPValue);
       req.input("matricula", sql.VarChar(255), row.matricula);
       req.input("numeroInscricaoEmpregador", sql.VarChar(255), row.numeroInscricaoEmpregador);
       req.input("elegivel", sql.VarChar(10), row.elegivel);
@@ -91,17 +92,24 @@ async function insertConsultaPresencaRows(rows) {
       req.input("valorParcela", sql.VarChar(10), row.valorParcela);
       req.input("taxaSeguro", sql.VarChar(10), row.taxaSeguro);
       req.input("valorSeguro", sql.VarChar(10), row.valorSeguro);
-      req.input("tipoConsulta", sql.VarChar(50), row.tipoConsulta);
+      const tipoConsultaValue = toVarcharOrNull(row.tipoConsulta || options.tipoConsulta || "Em lote", 50);
+      req.input("tipoConsulta", sql.VarChar(50), tipoConsultaValue);
+      const createdAtValue = options.createdAt || new Date();
+      const updatedAtValue = options.updatedAt || createdAtValue;
+      const statusValue = toVarcharOrNull(options.status || "Concluido", 50);
+      req.input("created_at", sql.DateTime2, createdAtValue);
+      req.input("updated_at", sql.DateTime2, updatedAtValue);
+      req.input("status", sql.VarChar(50), statusValue);
 
       await req.query(`
         INSERT INTO [presenca].[dbo].[consulta_presenca]
           ([cpf], [nome], [telefone], [loginP], [created_at], [updated_at], [matricula], [numeroInscricaoEmpregador], [elegivel],
            [valorMargemDisponivel], [valorMargemBase], [valorTotalDevido], [dataAdmissao], [dataNascimento], [nomeMae], [sexo],
-           [nomeTipo], [prazo], [taxaJuros], [valorLiberado], [valorParcela], [taxaSeguro], [valorSeguro], [tipoConsulta])
+           [nomeTipo], [prazo], [taxaJuros], [valorLiberado], [valorParcela], [taxaSeguro], [valorSeguro], [tipoConsulta], [status])
         VALUES
-          (@cpf, @nome, @telefone, @loginP, GETDATE(), GETDATE(), @matricula, @numeroInscricaoEmpregador, @elegivel,
+          (@cpf, @nome, @telefone, @loginP, @created_at, @updated_at, @matricula, @numeroInscricaoEmpregador, @elegivel,
            @valorMargemDisponivel, @valorMargemBase, @valorTotalDevido, @dataAdmissao, @dataNascimento, @nomeMae, @sexo,
-           @nomeTipo, @prazo, @taxaJuros, @valorLiberado, @valorParcela, @taxaSeguro, @valorSeguro, @tipoConsulta)
+           @nomeTipo, @prazo, @taxaJuros, @valorLiberado, @valorParcela, @taxaSeguro, @valorSeguro, @tipoConsulta, @status)
       `);
       inserted += 1;
     }
@@ -113,15 +121,123 @@ async function insertConsultaPresencaRows(rows) {
   }
 }
 
-async function saveConsultaPresencaResults(results, { loginP, tipoConsulta }) {
+async function insertPendingConsultaPresenca(rows, options = {}) {
+  const sanitizedRows = (rows || []).map((row) => ({
+    cpf: onlyDigits(row?.cpf),
+    nome: toVarcharOrNull(row?.nome, 100),
+    telefone: onlyDigits(row?.telefone),
+  }));
+  return insertConsultaPresencaRows(sanitizedRows, {
+    ...options,
+    status: "Pendente",
+    updatedAt: options.createdAt || new Date(),
+  });
+}
+
+async function upsertConsultaPresencaRows(rows, options = {}) {
+  if (!rows.length) return 0;
+  const pool = await getPool();
+  const tx = new sql.Transaction(pool);
+  await tx.begin();
+
+  try {
+    let processed = 0;
+    const loginPValue = toVarcharOrNull(options.loginP, 50);
+    const tipoConsultaValue = toVarcharOrNull(options.tipoConsulta || "Em lote", 50);
+    const createdAtValue = options.createdAt || new Date();
+    const updatedAtValue = options.updatedAt || new Date();
+    const statusValue = toVarcharOrNull(options.status || "Concluido", 50);
+
+    for (const row of rows) {
+      const req = new sql.Request(tx);
+      req.input("cpf", sql.BigInt, row.cpf);
+      req.input("nome", sql.VarChar(100), row.nome);
+      req.input("telefone", sql.BigInt, row.telefone);
+      req.input("loginP", sql.VarChar(50), loginPValue);
+      req.input("matricula", sql.VarChar(255), row.matricula);
+      req.input("numeroInscricaoEmpregador", sql.VarChar(255), row.numeroInscricaoEmpregador);
+      req.input("elegivel", sql.VarChar(10), row.elegivel);
+      req.input("valorMargemDisponivel", sql.VarChar(20), row.valorMargemDisponivel);
+      req.input("valorMargemBase", sql.VarChar(20), row.valorMargemBase);
+      req.input("valorTotalDevido", sql.VarChar(20), row.valorTotalDevido);
+      req.input("dataAdmissao", sql.Date, row.dataAdmissao);
+      req.input("dataNascimento", sql.Date, row.dataNascimento);
+      req.input("nomeMae", sql.VarChar(100), row.nomeMae);
+      req.input("sexo", sql.VarChar(2), row.sexo);
+      req.input("nomeTipo", sql.VarChar(150), row.nomeTipo);
+      req.input("prazo", sql.BigInt, row.prazo);
+      req.input("taxaJuros", sql.VarChar(5), row.taxaJuros);
+      req.input("valorLiberado", sql.VarChar(10), row.valorLiberado);
+      req.input("valorParcela", sql.VarChar(10), row.valorParcela);
+      req.input("taxaSeguro", sql.VarChar(10), row.taxaSeguro);
+      req.input("valorSeguro", sql.VarChar(10), row.valorSeguro);
+      req.input("created_at", sql.DateTime2, createdAtValue);
+      req.input("updated_at", sql.DateTime2, updatedAtValue);
+      const tipoConsultaParam = toVarcharOrNull(row.tipoConsulta || tipoConsultaValue, 50);
+      req.input("tipoConsulta", sql.VarChar(50), tipoConsultaParam);
+      req.input("status", sql.VarChar(50), statusValue);
+
+      await req.query(`
+        MERGE [presenca].[dbo].[consulta_presenca] AS target
+        USING (SELECT @cpf AS cpf, @loginP AS loginP, @tipoConsulta AS tipoConsulta, @created_at AS created_at) AS src
+          ON target.cpf = src.cpf AND target.loginP = src.loginP AND target.tipoConsulta = src.tipoConsulta AND target.created_at = src.created_at
+        WHEN MATCHED THEN
+          UPDATE SET
+            [nome] = @nome,
+            [telefone] = @telefone,
+            [matricula] = @matricula,
+            [numeroInscricaoEmpregador] = @numeroInscricaoEmpregador,
+            [elegivel] = @elegivel,
+            [valorMargemDisponivel] = @valorMargemDisponivel,
+            [valorMargemBase] = @valorMargemBase,
+            [valorTotalDevido] = @valorTotalDevido,
+            [dataAdmissao] = @dataAdmissao,
+            [dataNascimento] = @dataNascimento,
+            [nomeMae] = @nomeMae,
+            [sexo] = @sexo,
+            [nomeTipo] = @nomeTipo,
+            [prazo] = @prazo,
+            [taxaJuros] = @taxaJuros,
+            [valorLiberado] = @valorLiberado,
+            [valorParcela] = @valorParcela,
+            [taxaSeguro] = @taxaSeguro,
+            [valorSeguro] = @valorSeguro,
+            [updated_at] = @updated_at,
+            [status] = @status
+        WHEN NOT MATCHED THEN
+          INSERT ([cpf], [nome], [telefone], [loginP], [created_at], [updated_at], [matricula], [numeroInscricaoEmpregador], [elegivel],
+                  [valorMargemDisponivel], [valorMargemBase], [valorTotalDevido], [dataAdmissao], [dataNascimento], [nomeMae], [sexo],
+                  [nomeTipo], [prazo], [taxaJuros], [valorLiberado], [valorParcela], [taxaSeguro], [valorSeguro], [tipoConsulta], [status])
+          VALUES (@cpf, @nome, @telefone, @loginP, @created_at, @updated_at, @matricula, @numeroInscricaoEmpregador, @elegivel,
+                  @valorMargemDisponivel, @valorMargemBase, @valorTotalDevido, @dataAdmissao, @dataNascimento, @nomeMae, @sexo,
+                  @nomeTipo, @prazo, @taxaJuros, @valorLiberado, @valorParcela, @taxaSeguro, @valorSeguro, @tipoConsulta, @status);
+      `);
+
+      processed += 1;
+    }
+
+    await tx.commit();
+    return processed;
+  } catch (err) {
+    await tx.rollback();
+    throw err;
+  }
+}
+
+async function saveConsultaPresencaResults(results, { loginP, tipoConsulta, createdAt, status } = {}) {
   const rows = [];
   for (const result of results || []) {
     rows.push(...buildRowsFromResult(result, loginP, tipoConsulta));
   }
   const validRows = rows.filter((r) => r.cpf != null);
   const skippedRows = rows.length - validRows.length;
-  const insertedRows = await insertConsultaPresencaRows(validRows);
-  return { insertedRows, skippedRows };
+  const processed = await upsertConsultaPresencaRows(validRows, {
+    loginP,
+    tipoConsulta,
+    createdAt,
+    status,
+  });
+  return { insertedRows: processed, skippedRows };
 }
 
 async function getConsultedCpfsTodayByLogin(loginP, cpfs) {
@@ -156,5 +272,6 @@ async function getConsultedCpfsTodayByLogin(loginP, cpfs) {
 
 module.exports = {
   saveConsultaPresencaResults,
+  insertPendingConsultaPresenca,
   getConsultedCpfsTodayByLogin,
 };
