@@ -171,15 +171,21 @@ async function processClient(input, opts = {}) {
     return result;
   }
 
-  const loginResp = await login({ login: loginValue, senha: senhaValue, timeout, retries, retryDelayMs });
-  logs.push({ step: "POST /login", request: { login: loginValue }, status: loginResp.status, ok: loginResp.status === 200, response: loginResp.data });
-  if (loginResp.status !== 200 || !loginResp.data?.token) {
-    result.final_status = "ERRO";
-    result.final_message = "Falha login";
-    return result;
+  const authTokenValue = typeof opts.authToken === "string" ? opts.authToken.trim() : "";
+  let token = authTokenValue;
+  if (!token) {
+    const loginResp = await login({ login: loginValue, senha: senhaValue, timeout, retries, retryDelayMs });
+    logs.push({ step: "POST /login", request: { login: loginValue }, status: loginResp.status, ok: loginResp.status === 200, response: loginResp.data });
+    if (loginResp.status !== 200 || !loginResp.data?.token) {
+      result.final_status = "ERRO";
+      result.final_message = "Falha login";
+      return result;
+    }
+    token = String(loginResp.data.token);
+  } else {
+    logs.push({ step: "AUTH token reutilizado", request: { login: loginValue }, status: 200, ok: true, response: { reused: true } });
   }
   await waitStepDelay(stepDelayMs);
-  const token = loginResp.data.token;
   const headers = { Authorization: `Bearer ${token}` };
 
   const termoPayload = { cpf: result.cpf, nome: result.nome, telefone: result.telefone, produtoId };

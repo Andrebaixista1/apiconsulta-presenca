@@ -13,7 +13,7 @@ const toVarcharOrNull = (value, max) => {
   return text.slice(0, max);
 };
 
-function buildRowsFromResult(result, loginP, tipoConsulta) {
+function buildRowsFromResult(result, loginP, tipoConsulta, options = {}) {
   const base = {
     cpf: toBigIntOrNull(result?.cpf),
     nome: toVarcharOrNull(result?.nome, 100),
@@ -34,6 +34,7 @@ function buildRowsFromResult(result, loginP, tipoConsulta) {
 
   const tabelas = Array.isArray(result?.tabelas_body) ? result.tabelas_body : [];
   if (!tabelas.length) {
+    if (options.skipFallbackRow) return [];
     return [
       {
         ...base,
@@ -60,11 +61,26 @@ function buildRowsFromResult(result, loginP, tipoConsulta) {
   }));
 }
 
-async function insertConsultaPresencaRows(rows, options = {}) {
+function mapPendingRow(row) {
+  const cpfDigits = onlyDigits(row.cpf);
+  return {
+    id: Number(row.id),
+    cpf: cpfDigits ? cpfDigits.padStart(11, "0") : "",
+    nome: toVarcharOrNull(row.nome, 100),
+    telefone: onlyDigits(row.telefone),
+    loginP: toVarcharOrNull(row.loginP, 50),
+    tipoConsulta: toVarcharOrNull(row.tipoConsulta, 50),
+    createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
+    status: toVarcharOrNull(row.status, 50),
+  };
+}
+
+async function insertConsultaPresencaRows(rows, options = {}, exec = {}) {
   if (!rows.length) return 0;
   const pool = await getPool();
-  const tx = new sql.Transaction(pool);
-  await tx.begin();
+  const externalTx = exec.tx;
+  const tx = externalTx || new sql.Transaction(pool);
+  if (!externalTx) await tx.begin();
 
   try {
     let inserted = 0;
@@ -97,8 +113,9 @@ async function insertConsultaPresencaRows(rows, options = {}) {
       const createdAtValue = options.createdAt || new Date();
       const updatedAtValue = options.updatedAt || createdAtValue;
       const statusValue = toVarcharOrNull(options.status || "Concluido", 50);
-      req.input("created_at", sql.DateTime2, createdAtValue);
-      req.input("updated_at", sql.DateTime2, updatedAtValue);
+      // The table uses SQL Server `datetime` (not datetime2). Use the matching type to avoid precision mismatches.
+      req.input("created_at", sql.DateTime, createdAtValue);
+      req.input("updated_at", sql.DateTime, updatedAtValue);
       req.input("status", sql.VarChar(50), statusValue);
 
       await req.query(`
@@ -113,20 +130,22 @@ async function insertConsultaPresencaRows(rows, options = {}) {
       `);
       inserted += 1;
     }
-    await tx.commit();
+    if (!externalTx) await tx.commit();
     return inserted;
   } catch (err) {
-    await tx.rollback();
+    if (!externalTx) await tx.rollback();
     throw err;
   }
 }
 
 async function insertPendingConsultaPresenca(rows, options = {}) {
-  const sanitizedRows = (rows || []).map((row) => ({
-    cpf: onlyDigits(row?.cpf),
-    nome: toVarcharOrNull(row?.nome, 100),
-    telefone: onlyDigits(row?.telefone),
-  }));
+  const sanitizedRows = (rows || [])
+    .map((row) => ({
+      cpf: onlyDigits(row?.cpf),
+      nome: toVarcharOrNull(row?.nome, 100),
+      telefone: onlyDigits(row?.telefone),
+    }))
+    .filter((row) => row.cpf);
   return insertConsultaPresencaRows(sanitizedRows, {
     ...options,
     status: "Pendente",
@@ -134,90 +153,229 @@ async function insertPendingConsultaPresenca(rows, options = {}) {
   });
 }
 
-async function upsertConsultaPresencaRows(rows, options = {}) {
-  if (!rows.length) return 0;
+async function listPendingConsultaPresenca(limit = 50) {
+  const pool = await getPool();
+  const req = pool.request();
+  req.input("limit", sql.Int, Number(limit || 50));
+  req.input("status", sql.VarChar(50), "Pendente");
+  const rs = await req.query(`
+    SELECT TOP (@limit)
+      [id],
+      CAST([cpf] AS VARCHAR(20)) AS cpf,
+      [nome],
+      CAST([telefone] AS VARCHAR(20)) AS telefone,
+      [loginP],
+      [tipoConsulta],
+      [created_at],
+      [status]
+    FROM [presenca].[dbo].[consulta_presenca] WITH (READPAST)
+    WHERE [status] = @status
+    ORDER BY [created_at] ASC, [id] ASC
+  `);
+  return (rs.recordset || []).map(mapPendingRow);
+}
+
+async function claimPendingConsultaPresencaById(id) {
+  const pool = await getPool();
+  const tx = new sql.Transaction(pool);
+  await tx.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
+
+  try {
+    const sel = new sql.Request(tx);
+    sel.input("id", sql.Int, Number(id));
+    sel.input("status", sql.VarChar(50), "Pendente");
+    const current = await sel.query(`
+      SELECT TOP (1)
+        [id],
+        CAST([cpf] AS VARCHAR(20)) AS cpf,
+        [nome],
+        CAST([telefone] AS VARCHAR(20)) AS telefone,
+        [loginP],
+        [tipoConsulta],
+        [created_at],
+        [status]
+      FROM [presenca].[dbo].[consulta_presenca] WITH (UPDLOCK, ROWLOCK, READPAST)
+      WHERE [id] = @id
+        AND [status] = @status
+    `);
+
+    if (!current.recordset || !current.recordset.length) {
+      await tx.rollback();
+      return null;
+    }
+
+    const upd = new sql.Request(tx);
+    upd.input("id", sql.Int, Number(id));
+    upd.input("fromStatus", sql.VarChar(50), "Pendente");
+    upd.input("toStatus", sql.VarChar(50), "Processando");
+    const updated = await upd.query(`
+      UPDATE [presenca].[dbo].[consulta_presenca]
+      SET
+        [status] = @toStatus,
+        [updated_at] = GETDATE()
+      WHERE [id] = @id
+        AND [status] = @fromStatus
+    `);
+
+    if (!updated.rowsAffected || !updated.rowsAffected[0]) {
+      await tx.rollback();
+      return null;
+    }
+
+    await tx.commit();
+    return mapPendingRow({
+      ...current.recordset[0],
+      status: "Processando",
+    });
+  } catch (err) {
+    await tx.rollback();
+    throw err;
+  }
+}
+
+async function markConsultaPresencaStatusById(id, status) {
+  const pool = await getPool();
+  const req = pool.request();
+  req.input("id", sql.Int, Number(id));
+  req.input("status", sql.VarChar(50), toVarcharOrNull(status, 50));
+  const rs = await req.query(`
+    UPDATE [presenca].[dbo].[consulta_presenca]
+    SET
+      [status] = @status,
+      [updated_at] = GETDATE()
+    WHERE [id] = @id
+  `);
+  return Number((rs.rowsAffected && rs.rowsAffected[0]) || 0);
+}
+
+async function updateConsultaPresencaRowById(id, row, options = {}, exec = {}) {
+  const pool = await getPool();
+  const tx = exec.tx || new sql.Transaction(pool);
+  if (!exec.tx) await tx.begin();
+
+  try {
+    const req = new sql.Request(tx);
+    req.input("id", sql.Int, Number(id));
+    req.input("cpf", sql.BigInt, row.cpf);
+    req.input("nome", sql.VarChar(100), row.nome);
+    req.input("telefone", sql.BigInt, row.telefone);
+    const loginPValue = toVarcharOrNull(options.loginP, 50);
+    const tipoConsultaValue = toVarcharOrNull(options.tipoConsulta || row.tipoConsulta || "Em lote", 50);
+    const createdAtValue = options.createdAt || new Date();
+    const updatedAtValue = options.updatedAt || new Date();
+    const statusValue = toVarcharOrNull(options.status || "Concluido", 50);
+    req.input("loginP", sql.VarChar(50), loginPValue);
+    req.input("created_at", sql.DateTime, createdAtValue);
+    req.input("updated_at", sql.DateTime, updatedAtValue);
+    req.input("matricula", sql.VarChar(255), row.matricula);
+    req.input("numeroInscricaoEmpregador", sql.VarChar(255), row.numeroInscricaoEmpregador);
+    req.input("elegivel", sql.VarChar(10), row.elegivel);
+    req.input("valorMargemDisponivel", sql.VarChar(20), row.valorMargemDisponivel);
+    req.input("valorMargemBase", sql.VarChar(20), row.valorMargemBase);
+    req.input("valorTotalDevido", sql.VarChar(20), row.valorTotalDevido);
+    req.input("dataAdmissao", sql.Date, row.dataAdmissao);
+    req.input("dataNascimento", sql.Date, row.dataNascimento);
+    req.input("nomeMae", sql.VarChar(100), row.nomeMae);
+    req.input("sexo", sql.VarChar(2), row.sexo);
+    req.input("nomeTipo", sql.VarChar(150), row.nomeTipo);
+    req.input("prazo", sql.BigInt, row.prazo);
+    req.input("taxaJuros", sql.VarChar(5), row.taxaJuros);
+    req.input("valorLiberado", sql.VarChar(10), row.valorLiberado);
+    req.input("valorParcela", sql.VarChar(10), row.valorParcela);
+    req.input("taxaSeguro", sql.VarChar(10), row.taxaSeguro);
+    req.input("valorSeguro", sql.VarChar(10), row.valorSeguro);
+    req.input("tipoConsulta", sql.VarChar(50), tipoConsultaValue);
+    req.input("status", sql.VarChar(50), statusValue);
+
+    const rs = await req.query(`
+      UPDATE [presenca].[dbo].[consulta_presenca]
+      SET
+        [cpf] = @cpf,
+        [nome] = @nome,
+        [telefone] = @telefone,
+        [loginP] = @loginP,
+        [created_at] = @created_at,
+        [updated_at] = @updated_at,
+        [matricula] = @matricula,
+        [numeroInscricaoEmpregador] = @numeroInscricaoEmpregador,
+        [elegivel] = @elegivel,
+        [valorMargemDisponivel] = @valorMargemDisponivel,
+        [valorMargemBase] = @valorMargemBase,
+        [valorTotalDevido] = @valorTotalDevido,
+        [dataAdmissao] = @dataAdmissao,
+        [dataNascimento] = @dataNascimento,
+        [nomeMae] = @nomeMae,
+        [sexo] = @sexo,
+        [nomeTipo] = @nomeTipo,
+        [prazo] = @prazo,
+        [taxaJuros] = @taxaJuros,
+        [valorLiberado] = @valorLiberado,
+        [valorParcela] = @valorParcela,
+        [taxaSeguro] = @taxaSeguro,
+        [valorSeguro] = @valorSeguro,
+        [tipoConsulta] = @tipoConsulta,
+        [status] = @status
+      WHERE [id] = @id
+    `);
+
+    if (!exec.tx) await tx.commit();
+    return Number((rs.rowsAffected && rs.rowsAffected[0]) || 0);
+  } catch (err) {
+    if (!exec.tx) await tx.rollback();
+    throw err;
+  }
+}
+
+async function replacePendingConsultaPresencaById(pendingRow, results, options = {}) {
+  const rows = [];
+  for (const result of results || []) {
+    rows.push(
+      ...buildRowsFromResult(result, pendingRow?.loginP, pendingRow?.tipoConsulta, {
+        skipFallbackRow: options.skipFallbackRow,
+      })
+    );
+  }
+  const validRows = rows.filter((r) => r.cpf != null);
+  const skippedRows = rows.length - validRows.length;
+
   const pool = await getPool();
   const tx = new sql.Transaction(pool);
   await tx.begin();
 
   try {
-    let processed = 0;
-    const loginPValue = toVarcharOrNull(options.loginP, 50);
-    const tipoConsultaValue = toVarcharOrNull(options.tipoConsulta || "Em lote", 50);
-    const createdAtValue = options.createdAt || new Date();
-    const updatedAtValue = options.updatedAt || new Date();
-    const statusValue = toVarcharOrNull(options.status || "Concluido", 50);
+    let updatedRows = 0;
+    let insertedRows = 0;
+    const baseOptions = {
+      loginP: pendingRow.loginP,
+      tipoConsulta: pendingRow.tipoConsulta,
+      createdAt: pendingRow.createdAt,
+      status: options.status || "Concluido",
+    };
 
-    for (const row of rows) {
-      const req = new sql.Request(tx);
-      req.input("cpf", sql.BigInt, row.cpf);
-      req.input("nome", sql.VarChar(100), row.nome);
-      req.input("telefone", sql.BigInt, row.telefone);
-      req.input("loginP", sql.VarChar(50), loginPValue);
-      req.input("matricula", sql.VarChar(255), row.matricula);
-      req.input("numeroInscricaoEmpregador", sql.VarChar(255), row.numeroInscricaoEmpregador);
-      req.input("elegivel", sql.VarChar(10), row.elegivel);
-      req.input("valorMargemDisponivel", sql.VarChar(20), row.valorMargemDisponivel);
-      req.input("valorMargemBase", sql.VarChar(20), row.valorMargemBase);
-      req.input("valorTotalDevido", sql.VarChar(20), row.valorTotalDevido);
-      req.input("dataAdmissao", sql.Date, row.dataAdmissao);
-      req.input("dataNascimento", sql.Date, row.dataNascimento);
-      req.input("nomeMae", sql.VarChar(100), row.nomeMae);
-      req.input("sexo", sql.VarChar(2), row.sexo);
-      req.input("nomeTipo", sql.VarChar(150), row.nomeTipo);
-      req.input("prazo", sql.BigInt, row.prazo);
-      req.input("taxaJuros", sql.VarChar(5), row.taxaJuros);
-      req.input("valorLiberado", sql.VarChar(10), row.valorLiberado);
-      req.input("valorParcela", sql.VarChar(10), row.valorParcela);
-      req.input("taxaSeguro", sql.VarChar(10), row.taxaSeguro);
-      req.input("valorSeguro", sql.VarChar(10), row.valorSeguro);
-      req.input("created_at", sql.DateTime2, createdAtValue);
-      req.input("updated_at", sql.DateTime2, updatedAtValue);
-      const tipoConsultaParam = toVarcharOrNull(row.tipoConsulta || tipoConsultaValue, 50);
-      req.input("tipoConsulta", sql.VarChar(50), tipoConsultaParam);
-      req.input("status", sql.VarChar(50), statusValue);
-
-      await req.query(`
-        MERGE [presenca].[dbo].[consulta_presenca] AS target
-        USING (SELECT @cpf AS cpf, @loginP AS loginP, @tipoConsulta AS tipoConsulta, @created_at AS created_at) AS src
-          ON target.cpf = src.cpf AND target.loginP = src.loginP AND target.tipoConsulta = src.tipoConsulta AND target.created_at = src.created_at
-        WHEN MATCHED THEN
-          UPDATE SET
-            [nome] = @nome,
-            [telefone] = @telefone,
-            [matricula] = @matricula,
-            [numeroInscricaoEmpregador] = @numeroInscricaoEmpregador,
-            [elegivel] = @elegivel,
-            [valorMargemDisponivel] = @valorMargemDisponivel,
-            [valorMargemBase] = @valorMargemBase,
-            [valorTotalDevido] = @valorTotalDevido,
-            [dataAdmissao] = @dataAdmissao,
-            [dataNascimento] = @dataNascimento,
-            [nomeMae] = @nomeMae,
-            [sexo] = @sexo,
-            [nomeTipo] = @nomeTipo,
-            [prazo] = @prazo,
-            [taxaJuros] = @taxaJuros,
-            [valorLiberado] = @valorLiberado,
-            [valorParcela] = @valorParcela,
-            [taxaSeguro] = @taxaSeguro,
-            [valorSeguro] = @valorSeguro,
-            [updated_at] = @updated_at,
-            [status] = @status
-        WHEN NOT MATCHED THEN
-          INSERT ([cpf], [nome], [telefone], [loginP], [created_at], [updated_at], [matricula], [numeroInscricaoEmpregador], [elegivel],
-                  [valorMargemDisponivel], [valorMargemBase], [valorTotalDevido], [dataAdmissao], [dataNascimento], [nomeMae], [sexo],
-                  [nomeTipo], [prazo], [taxaJuros], [valorLiberado], [valorParcela], [taxaSeguro], [valorSeguro], [tipoConsulta], [status])
-          VALUES (@cpf, @nome, @telefone, @loginP, @created_at, @updated_at, @matricula, @numeroInscricaoEmpregador, @elegivel,
-                  @valorMargemDisponivel, @valorMargemBase, @valorTotalDevido, @dataAdmissao, @dataNascimento, @nomeMae, @sexo,
-                  @nomeTipo, @prazo, @taxaJuros, @valorLiberado, @valorParcela, @taxaSeguro, @valorSeguro, @tipoConsulta, @status);
+    if (validRows.length > 0) {
+      // Upsert behavior: update original pending row with the first result.
+      updatedRows = await updateConsultaPresencaRowById(pendingRow.id, validRows[0], baseOptions, { tx });
+      // Additional results are appended as new rows preserving login/file(created_at+tipoConsulta).
+      const extraRows = validRows.slice(1);
+      if (extraRows.length > 0) {
+        insertedRows = await insertConsultaPresencaRows(extraRows, baseOptions, { tx });
+      }
+    } else {
+      const upd = new sql.Request(tx);
+      upd.input("id", sql.Int, Number(pendingRow.id));
+      upd.input("status", sql.VarChar(50), toVarcharOrNull(options.status || "Concluido", 50));
+      const rs = await upd.query(`
+        UPDATE [presenca].[dbo].[consulta_presenca]
+        SET
+          [status] = @status,
+          [updated_at] = GETDATE()
+        WHERE [id] = @id
       `);
-
-      processed += 1;
+      updatedRows = Number((rs.rowsAffected && rs.rowsAffected[0]) || 0);
     }
 
     await tx.commit();
-    return processed;
+    return { updatedRows, insertedRows, totalRows: updatedRows + insertedRows, skippedRows };
   } catch (err) {
     await tx.rollback();
     throw err;
@@ -231,13 +389,41 @@ async function saveConsultaPresencaResults(results, { loginP, tipoConsulta, crea
   }
   const validRows = rows.filter((r) => r.cpf != null);
   const skippedRows = rows.length - validRows.length;
-  const processed = await upsertConsultaPresencaRows(validRows, {
-    loginP,
-    tipoConsulta,
-    createdAt,
-    status,
-  });
-  return { insertedRows: processed, skippedRows };
+  const createdAtValue = createdAt || new Date();
+  const loginPValue = toVarcharOrNull(loginP, 50);
+  const tipoConsultaValue = toVarcharOrNull(tipoConsulta || (validRows[0] && validRows[0].tipoConsulta) || "Em lote", 50);
+
+  const pool = await getPool();
+  const tx = new sql.Transaction(pool);
+  await tx.begin();
+
+  try {
+    // Replace any existing rows for the same batch (loginP + tipoConsulta + created_at).
+    // This avoids leaving stale "Pendente" rows and allows persisting multiple rows per CPF
+    // (the external API typically returns several table options).
+    const del = new sql.Request(tx);
+    del.input("loginP", sql.VarChar(50), loginPValue);
+    del.input("tipoConsulta", sql.VarChar(50), tipoConsultaValue);
+    del.input("created_at", sql.DateTime, createdAtValue);
+    await del.query(`
+      DELETE FROM [presenca].[dbo].[consulta_presenca]
+      WHERE [loginP] = @loginP
+        AND [tipoConsulta] = @tipoConsulta
+        AND [created_at] = @created_at
+    `);
+
+    const insertedRows = await insertConsultaPresencaRows(
+      validRows,
+      { loginP: loginPValue, tipoConsulta: tipoConsultaValue, createdAt: createdAtValue, status },
+      { tx }
+    );
+
+    await tx.commit();
+    return { insertedRows, skippedRows };
+  } catch (err) {
+    await tx.rollback();
+    throw err;
+  }
 }
 
 async function getConsultedCpfsTodayByLogin(loginP, cpfs) {
@@ -273,5 +459,9 @@ async function getConsultedCpfsTodayByLogin(loginP, cpfs) {
 module.exports = {
   saveConsultaPresencaResults,
   insertPendingConsultaPresenca,
+  listPendingConsultaPresenca,
+  claimPendingConsultaPresencaById,
+  markConsultaPresencaStatusById,
+  replacePendingConsultaPresencaById,
   getConsultedCpfsTodayByLogin,
 };

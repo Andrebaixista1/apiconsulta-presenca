@@ -3,12 +3,12 @@ const multer = require("multer");
 const {
   processClient,
   parseInputRowsFromUpload,
-  processCsvBatch,
   InputFileValidationError,
 } = require("./processor");
 const { consumeConsultDay, DEFAULT_TOTAL_LIMIT, ConsultDayLimitError } = require("./consultDayRepo");
 const { saveConsultaPresencaResults, insertPendingConsultaPresenca, getConsultedCpfsTodayByLogin } = require("./consultaPresencaRepo");
 const { createJob, markProgress, markSkipped, finishJob, getJob, getCurrentJob } = require("./statusTracker");
+const { startPendingMonitor } = require("./pendingMonitor");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -90,9 +90,8 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "Envie um arquivo CSV (;) ou XLSX no campo file" });
     }
-    const { randomRows = 0, produtoId, autoAcceptHeadless = "true", stepDelayMs, login, senha } = req.body || {};
+    const { randomRows = 0, login } = req.body || {};
     const loginValue = String(login || DEFAULT_PRESENCA_LOGIN);
-    const senhaValue = String(senha || DEFAULT_PRESENCA_SENHA);
     const rows = parseInputRowsFromUpload(req.file);
     if (rows.length > MAX_CSV_ROWS) {
       return res.status(400).json({
@@ -153,56 +152,15 @@ app.post("/api/process/csv", upload.single("file"), async (req, res) => {
         createdAt,
       }
     );
-    const usedDelta = rowsToProcess.length;
-    let consultDay;
-    try {
-      consultDay = await consumeConsultDay({
-        loginP: loginValue,
-        senhaP: senhaValue,
-        usedDelta,
-        total: DEFAULT_TOTAL_LIMIT,
-      });
-    } catch (err) {
-      if (err instanceof ConsultDayLimitError) {
-        if (jobId) finishJob(jobId, { errorMessage: err.message });
-        return res.status(403).json({
-          ok: false,
-          error: err.message,
-          consultDay: err.meta,
-        });
-      }
-      throw err;
-    }
-    const results = await processCsvBatch(rowsToProcess, {
-      randomRows: 0,
-      produtoId: produtoId ? Number(produtoId) : 28,
-      autoAcceptHeadless: String(autoAcceptHeadless).toLowerCase() !== "false",
-      stepDelayMs: stepDelayMs != null ? Number(stepDelayMs) : undefined,
-      login: loginValue,
-      senha: senhaValue,
-      onItemProcessed: async (item) => {
-        markProgress(jobId, { ok: item.final_status === "OK", errorMessage: item.final_message });
-      },
-    });
-    const persisted = await saveConsultaPresencaResults(results, {
-      loginP: loginValue,
-      tipoConsulta: fileNameValue,
-      createdAt,
-      status: "Concluido",
-    });
-    const okCount = results.filter((r) => r.final_status === "OK").length;
     finishJob(jobId);
     return res.json({
       ok: true,
+      queued: true,
       jobId,
-      total: results.length,
-      okCount,
-      erroCount: results.length - okCount,
-      consultDay,
-      persisted,
+      totalQueued: rowsToProcess.length,
       skippedDuplicatedInFile,
       skippedDuplicatedToday,
-      results,
+      message: "Registros inseridos com status Pendente. O monitor processa automaticamente a cada 5 segundos.",
     });
   } catch (err) {
     if (jobId) finishJob(jobId, { errorMessage: String(err.message || err) });
@@ -218,4 +176,5 @@ app.listen(PORT, () => {
   console.log(`API Presenca Node rodando na porta ${PORT}`);
   console.log("POST /api/process/individual");
   console.log("POST /api/process/csv");
+  startPendingMonitor();
 });
