@@ -39,13 +39,24 @@ app.get("/api/status/:jobId", (req, res) => {
 app.post("/api/process/individual", async (req, res) => {
   let jobId = null;
   try {
-    const { cpf, nome, telefone, produtoId, autoAcceptHeadless = true, stepDelayMs, login, senha } = req.body || {};
+    const {
+      cpf,
+      nome,
+      telefone,
+      produtoId,
+      autoAcceptHeadless = true,
+      stepDelayMs,
+      login,
+      senha,
+      loginP,
+      senhaP,
+    } = req.body || {};
     if (!cpf || !nome || !telefone) {
       return res.status(400).json({ ok: false, error: "Informe cpf, nome e telefone" });
     }
 
-    const loginValue = String(login || DEFAULT_PRESENCA_LOGIN);
-    const senhaValue = String(senha || DEFAULT_PRESENCA_SENHA);
+    const loginValue = String(loginP || login || DEFAULT_PRESENCA_LOGIN);
+    const senhaValue = String(senhaP || senha || DEFAULT_PRESENCA_SENHA);
 
     jobId = createJob({ type: "individual", total: 1 });
 

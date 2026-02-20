@@ -183,18 +183,34 @@ async function listPendingConsultaPresenca(limit = 50) {
   req.input("limit", sql.Int, Number(limit || 50));
   req.input("status", sql.VarChar(50), "Pendente");
   const rs = await req.query(`
+    ;WITH pending AS (
+      SELECT
+        [id],
+        CAST([cpf] AS VARCHAR(20)) AS cpf,
+        [nome],
+        CAST([telefone] AS VARCHAR(20)) AS telefone,
+        [loginP],
+        [tipoConsulta],
+        [created_at],
+        [status],
+        ROW_NUMBER() OVER (
+          PARTITION BY COALESCE(NULLIF([loginP], ''), '__SEM_LOGIN__')
+          ORDER BY [id] ASC
+        ) AS login_order
+      FROM [presenca].[dbo].[consulta_presenca] WITH (READPAST)
+      WHERE [status] = @status
+    )
     SELECT TOP (@limit)
       [id],
-      CAST([cpf] AS VARCHAR(20)) AS cpf,
+      [cpf],
       [nome],
-      CAST([telefone] AS VARCHAR(20)) AS telefone,
+      [telefone],
       [loginP],
       [tipoConsulta],
       [created_at],
       [status]
-    FROM [presenca].[dbo].[consulta_presenca] WITH (READPAST)
-    WHERE [status] = @status
-    ORDER BY [id] ASC
+    FROM pending
+    ORDER BY [login_order] ASC, [id] ASC
   `);
   return (rs.recordset || []).map(mapPendingRow);
 }
