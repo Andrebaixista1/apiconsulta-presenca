@@ -13,7 +13,7 @@ const {
 
 const DEFAULT_LOGIN = process.env.PRESENCA_LOGIN || "40138573832_HDSL";
 const DEFAULT_SENHA = process.env.PRESENCA_SENHA || "Presenca@1516";
-const DEFAULT_STEP_DELAY_MS = Number(process.env.PRESENCA_STEP_DELAY_MS || 2000);
+const FIXED_STEP_DELAY_MS = 2000;
 const REQUIRED_FILE_COLUMNS = ["CPF", "NOME", "TELEFONE"];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -42,6 +42,43 @@ function flattenApi5(result) {
     margem_status: result.margem_status ?? null,
     tabelas_status: result.tabelas_status ?? null,
   };
+
+  const vinculosProcessados = Array.isArray(result?.vinculos_processados) ? result.vinculos_processados : [];
+  if (vinculosProcessados.length) {
+    const rows = [];
+    for (const vincItem of vinculosProcessados) {
+      const vincBase = {
+        ...base,
+        matricula: vincItem?.vinculo?.matricula ?? null,
+        numeroInscricaoEmpregador: vincItem?.vinculo?.numeroInscricaoEmpregador ?? null,
+        elegivel: vincItem?.vinculo?.elegivel ?? null,
+        margem_status: vincItem?.margem_status ?? null,
+        tabelas_status: vincItem?.tabelas_status ?? null,
+        vinculo_message: vincItem?.mensagem ?? null,
+      };
+      const tabelas = Array.isArray(vincItem?.tabelas_body) ? vincItem.tabelas_body : [];
+      if (vincItem?.tabelas_status === 200 && tabelas.length) {
+        rows.push(
+          ...tabelas.map((item) => ({
+            ...vincBase,
+            id: item?.id ?? null,
+            nome_tabela: item?.nome ?? null,
+            prazo: item?.prazo ?? null,
+            taxaJuros: item?.taxaJuros ?? null,
+            valorLiberado: item?.valorLiberado ?? null,
+            tipoCredito: item?.tipoCredito?.name ?? null,
+            valorParcela: item?.valorParcela ?? null,
+            taxaSeguro: item?.taxaSeguro ?? null,
+            valorSeguro: item?.valorSeguro ?? null,
+          }))
+        );
+      } else {
+        rows.push({ ...vincBase });
+      }
+    }
+    if (rows.length) return rows;
+  }
+
   if (result.tabelas_status === 200 && Array.isArray(result.tabelas_body)) {
     return result.tabelas_body.map((item) => ({
       ...base,
@@ -154,7 +191,12 @@ async function processClient(input, opts = {}) {
   const retries = Number(opts.retries || 2);
   const retryDelayMs = Number(opts.retryDelayMs || 1500);
   const autoAcceptHeadless = opts.autoAcceptHeadless !== false;
-  const stepDelayMs = Number(opts.stepDelayMs ?? DEFAULT_STEP_DELAY_MS);
+  const acceptAttempts = Math.max(1, Number(opts.acceptAttempts || process.env.PRESENCA_HEADLESS_ACCEPT_ATTEMPTS || 2));
+  const acceptRetryDelayMs = Math.max(
+    500,
+    Number(opts.acceptRetryDelayMs || process.env.PRESENCA_HEADLESS_ACCEPT_RETRY_DELAY_MS || 1500)
+  );
+  const stepDelayMs = FIXED_STEP_DELAY_MS;
 
   const logs = [];
   const result = {
@@ -171,20 +213,14 @@ async function processClient(input, opts = {}) {
     return result;
   }
 
-  const authTokenValue = typeof opts.authToken === "string" ? opts.authToken.trim() : "";
-  let token = authTokenValue;
-  if (!token) {
-    const loginResp = await login({ login: loginValue, senha: senhaValue, timeout, retries, retryDelayMs });
-    logs.push({ step: "POST /login", request: { login: loginValue }, status: loginResp.status, ok: loginResp.status === 200, response: loginResp.data });
-    if (loginResp.status !== 200 || !loginResp.data?.token) {
-      result.final_status = "ERRO";
-      result.final_message = "Falha login";
-      return result;
-    }
-    token = String(loginResp.data.token);
-  } else {
-    logs.push({ step: "AUTH token reutilizado", request: { login: loginValue }, status: 200, ok: true, response: { reused: true } });
+  const loginResp = await login({ login: loginValue, senha: senhaValue, timeout, retries, retryDelayMs });
+  logs.push({ step: "POST /login", request: { login: loginValue }, status: loginResp.status, ok: loginResp.status === 200, response: loginResp.data });
+  if (loginResp.status !== 200 || !loginResp.data?.token) {
+    result.final_status = "ERRO";
+    result.final_message = "Falha login";
+    return result;
   }
+  const token = String(loginResp.data.token);
   await waitStepDelay(stepDelayMs);
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -199,18 +235,49 @@ async function processClient(input, opts = {}) {
   }
 
   if (autoAcceptHeadless) {
-    try {
-      const acceptResp = await acceptTermoHeadless(termoResp.data.shortUrl, termoResp.data.autorizacaoId, Math.floor(timeout / 1000));
-      logs.push({ step: "HEADLESS aceitar termo", request: { shortUrl: termoResp.data.shortUrl }, status: acceptResp.ok ? 200 : 400, ok: acceptResp.ok, response: { calls: acceptResp.calls } });
-      if (!acceptResp.ok) {
-        result.final_status = "ERRO";
-        result.final_message = "Falha aceite headless";
-        return result;
+    let accepted = false;
+    let acceptFailureReason = "Falha aceite headless";
+
+    for (let attempt = 1; attempt <= acceptAttempts; attempt += 1) {
+      try {
+        const acceptResp = await acceptTermoHeadless(
+          termoResp.data.shortUrl,
+          termoResp.data.autorizacaoId,
+          Math.floor(timeout / 1000)
+        );
+        logs.push({
+          step: `HEADLESS aceitar termo (${attempt}/${acceptAttempts})`,
+          request: { shortUrl: termoResp.data.shortUrl, autorizacaoId: termoResp.data.autorizacaoId },
+          status: acceptResp.ok ? 200 : 400,
+          ok: acceptResp.ok,
+          response: { putStatus: acceptResp.putStatus, reason: acceptResp.reason, calls: acceptResp.calls },
+        });
+
+        if (acceptResp.ok) {
+          accepted = true;
+          break;
+        }
+
+        acceptFailureReason = acceptResp.reason || "Aceite nao confirmado";
+      } catch (err) {
+        acceptFailureReason = String(err.message || err);
+        logs.push({
+          step: `HEADLESS aceitar termo (${attempt}/${acceptAttempts})`,
+          request: { shortUrl: termoResp.data.shortUrl, autorizacaoId: termoResp.data.autorizacaoId },
+          status: 500,
+          ok: false,
+          response: { error: acceptFailureReason },
+        });
       }
-    } catch (err) {
-      logs.push({ step: "HEADLESS aceitar termo", request: { shortUrl: termoResp.data.shortUrl }, status: 500, ok: false, response: { error: String(err.message || err) } });
+
+      if (attempt < acceptAttempts) {
+        await waitStepDelay(acceptRetryDelayMs);
+      }
+    }
+
+    if (!accepted) {
       result.final_status = "ERRO";
-      result.final_message = "Falha aceite headless";
+      result.final_message = acceptFailureReason ? `Falha aceite headless: ${acceptFailureReason}` : "Falha aceite headless";
       return result;
     }
   }
@@ -227,68 +294,133 @@ async function processClient(input, opts = {}) {
   }
 
   const vinculos = Array.isArray(vincResp.data?.id) ? vincResp.data.id : [];
-  const vinculo = vinculos.find((v) => v.elegivel === true) || vinculos[0];
-  result.vinculo = vinculo || null;
-  if (!vinculo?.matricula || !vinculo?.numeroInscricaoEmpregador) {
+  result.vinculos = vinculos;
+  const vinculosOrdenados = [...vinculos].sort((a, b) => Number(Boolean(b?.elegivel)) - Number(Boolean(a?.elegivel)));
+  const vinculosValidos = vinculosOrdenados.filter((v) => v?.matricula && v?.numeroInscricaoEmpregador);
+
+  if (!vinculosValidos.length) {
     result.final_status = "ERRO";
     result.final_message = "Sem vinculo elegivel";
     return result;
   }
-  await waitStepDelay(stepDelayMs);
 
-  const margemPayload = {
-    cpf: result.cpf,
-    matricula: String(vinculo.matricula),
-    cnpj: String(vinculo.numeroInscricaoEmpregador),
-  };
-  const margemResp = await postWithRetry(`${BASE_URL}/v3/operacoes/consignado-privado/consultar-margem`, margemPayload, headers, { timeout, retries, retryDelayMs });
-  result.margem_status = margemResp.status;
-  result.margem_data = margemResp.data || null;
-  logs.push({ step: "POST /v3/operacoes/consignado-privado/consultar-margem", request: margemPayload, status: margemResp.status, ok: margemResp.status === 200, response: margemResp.data });
-  if (margemResp.status !== 200 || !margemResp.data) {
-    result.final_status = "ERRO";
-    result.final_message = "Falha consultar-margem";
-    return result;
-  }
-  await waitStepDelay(stepDelayMs);
+  result.vinculos_processados = [];
+  let okCount = 0;
 
-  const m = margemResp.data;
-  const tabelasPayload = {
-    tomador: {
+  for (let i = 0; i < vinculosValidos.length; i += 1) {
+    const vinculo = vinculosValidos[i];
+    if (i === 0) {
+      await waitStepDelay(stepDelayMs);
+    } else {
+      // Keep spacing between APIs even when iterating multiple vinculos.
+      await waitStepDelay(stepDelayMs);
+    }
+
+    const margemPayload = {
       cpf: result.cpf,
-      nome: result.nome,
-      telefone: { ddd: result.telefone.slice(0, 2), numero: result.telefone.slice(2) },
-      dataNascimento: m.dataNascimento || "1990-01-01",
-      email: "emailmock@mock.com.br",
-      sexo: m.sexo || "M",
-      nomeMae: m.nomeMae || "NAO INFORMADO",
-      vinculoEmpregaticio: {
-        cnpjEmpregador: String(m.cnpjEmpregador || vinculo.numeroInscricaoEmpregador),
-        registroEmpregaticio: String(m.registroEmpregaticio || vinculo.matricula),
-      },
-      dadosBancarios: { codigoBanco: null, agencia: null, conta: null, digitoConta: null, formaCredito: null },
-      endereco: { cep: "", rua: "", numero: "", complemento: "", cidade: "", estado: "", bairro: "" },
-    },
-    proposta: {
-      valorSolicitado: 0,
-      quantidadeParcelas: 0,
-      produtoId,
-      valorParcela: Number(m.valorMargemDisponivel || 0),
-    },
-    documentos: [],
-  };
-  const tabResp = await postWithRetry(`${BASE_URL}/v5/operacoes/simulacao/disponiveis`, tabelasPayload, headers, { timeout, retries, retryDelayMs });
-  result.tabelas_status = tabResp.status;
-  result.tabelas_body = tabResp.data;
-  logs.push({ step: "POST /v5/operacoes/simulacao/disponiveis", request: tabelasPayload, status: tabResp.status, ok: tabResp.status === 200, response: tabResp.data });
+      matricula: String(vinculo.matricula),
+      cnpj: String(vinculo.numeroInscricaoEmpregador),
+    };
+    const margemResp = await postWithRetry(
+      `${BASE_URL}/v3/operacoes/consignado-privado/consultar-margem`,
+      margemPayload,
+      headers,
+      { timeout, retries, retryDelayMs }
+    );
+    logs.push({
+      step: `POST /v3/operacoes/consignado-privado/consultar-margem [matricula=${vinculo.matricula}]`,
+      request: margemPayload,
+      status: margemResp.status,
+      ok: margemResp.status === 200,
+      response: margemResp.data,
+    });
 
-  if (tabResp.status === 200) {
+    const vinculoItem = {
+      vinculo,
+      margem_status: margemResp.status,
+      margem_data: margemResp.data || null,
+      tabelas_status: null,
+      tabelas_body: null,
+      mensagem: null,
+    };
+
+    if (margemResp.status !== 200 || !margemResp.data) {
+      vinculoItem.mensagem = "Falha consultar-margem";
+      result.vinculos_processados.push(vinculoItem);
+      continue;
+    }
+
+    await waitStepDelay(stepDelayMs);
+    const m = margemResp.data;
+    const tabelasPayload = {
+      tomador: {
+        cpf: result.cpf,
+        nome: result.nome,
+        telefone: { ddd: result.telefone.slice(0, 2), numero: result.telefone.slice(2) },
+        dataNascimento: m.dataNascimento || "1990-01-01",
+        email: "emailmock@mock.com.br",
+        sexo: m.sexo || "M",
+        nomeMae: m.nomeMae || "NAO INFORMADO",
+        vinculoEmpregaticio: {
+          cnpjEmpregador: String(m.cnpjEmpregador || vinculo.numeroInscricaoEmpregador),
+          registroEmpregaticio: String(m.registroEmpregaticio || vinculo.matricula),
+        },
+        dadosBancarios: { codigoBanco: null, agencia: null, conta: null, digitoConta: null, formaCredito: null },
+        endereco: { cep: "", rua: "", numero: "", complemento: "", cidade: "", estado: "", bairro: "" },
+      },
+      proposta: {
+        valorSolicitado: 0,
+        quantidadeParcelas: 0,
+        produtoId,
+        valorParcela: Number(m.valorMargemDisponivel || 0),
+      },
+      documentos: [],
+    };
+
+    const tabResp = await postWithRetry(`${BASE_URL}/v5/operacoes/simulacao/disponiveis`, tabelasPayload, headers, {
+      timeout,
+      retries,
+      retryDelayMs,
+    });
+    logs.push({
+      step: `POST /v5/operacoes/simulacao/disponiveis [matricula=${vinculo.matricula}]`,
+      request: tabelasPayload,
+      status: tabResp.status,
+      ok: tabResp.status === 200,
+      response: tabResp.data,
+    });
+
+    vinculoItem.tabelas_status = tabResp.status;
+    vinculoItem.tabelas_body = tabResp.data;
+
+    if (tabResp.status === 200) {
+      vinculoItem.mensagem = "Fluxo completo OK";
+      okCount += 1;
+    } else {
+      const errs = Array.isArray(tabResp.data?.errors) ? tabResp.data.errors.join(" | ") : "";
+      vinculoItem.mensagem = errs ? `Falha consultar-tabelas: ${errs}` : `Falha consultar-tabelas: status ${tabResp.status}`;
+    }
+
+    result.vinculos_processados.push(vinculoItem);
+  }
+
+  const primeiro = result.vinculos_processados[0] || null;
+  const primeiroOk = result.vinculos_processados.find((item) => item.tabelas_status === 200) || primeiro;
+  result.vinculo = primeiroOk?.vinculo || primeiro?.vinculo || null;
+  result.margem_status = primeiroOk?.margem_status ?? primeiro?.margem_status ?? null;
+  result.margem_data = primeiroOk?.margem_data ?? primeiro?.margem_data ?? null;
+  result.tabelas_status = primeiroOk?.tabelas_status ?? primeiro?.tabelas_status ?? null;
+  result.tabelas_body = primeiroOk?.tabelas_body ?? primeiro?.tabelas_body ?? null;
+
+  if (okCount > 0) {
     result.final_status = "OK";
-    result.final_message = "Fluxo completo OK";
+    result.final_message = okCount === vinculosValidos.length ? "Fluxo completo OK" : `Fluxo parcial OK (${okCount}/${vinculosValidos.length} vinculos)`;
   } else {
-    const errs = Array.isArray(tabResp.data?.errors) ? tabResp.data.errors.join(" | ") : "";
+    const erros = result.vinculos_processados
+      .map((item) => `matricula ${item?.vinculo?.matricula || "?"}: ${item?.mensagem || "erro"}`)
+      .join(" | ");
     result.final_status = "ERRO";
-    result.final_message = errs ? `Falha consultar-tabelas: ${errs}` : `Falha consultar-tabelas: status ${tabResp.status}`;
+    result.final_message = erros ? `Falha em todos os vinculos: ${erros}` : "Falha consultar-vinculos";
   }
   return result;
 }

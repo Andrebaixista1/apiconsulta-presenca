@@ -40,6 +40,7 @@ async function login({ login, senha, timeout = 30000, retries = 2, retryDelayMs 
 
 async function acceptTermoHeadless(shortUrl, autorizacaoId, timeoutSeconds = 45) {
   const calls = [];
+  const timeoutMs = Math.max(10000, Number(timeoutSeconds || 45) * 1000);
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext({
@@ -54,29 +55,54 @@ async function acceptTermoHeadless(shortUrl, autorizacaoId, timeoutSeconds = 45)
         calls.push({ method: req.method(), url: resp.url(), status: resp.status() });
       }
     });
-    await page.goto(shortUrl, { waitUntil: "domcontentloaded", timeout: timeoutSeconds * 1000 });
+    await page.goto(shortUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 12000) }).catch(() => {});
     await page.waitForTimeout(1200);
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(700);
 
-    const checkbox = page.getByLabel(/autorizo.*dataprev/i);
-    if ((await checkbox.count()) > 0) {
-      await checkbox.first().check({ force: true });
-    } else {
-      await page.locator("input[type='checkbox']").first().check({ force: true });
+    let checkbox = page.getByLabel(/autorizo.*dataprev/i);
+    if ((await checkbox.count()) === 0) {
+      checkbox = page.locator("input[type='checkbox']");
     }
+    if ((await checkbox.count()) === 0) {
+      throw new Error("Checkbox de autorizacao nao encontrado");
+    }
+    await checkbox.first().scrollIntoViewIfNeeded().catch(() => {});
+    await checkbox.first().check({ force: true, timeout: Math.min(timeoutMs, 15000) });
 
     let button = page.getByRole("button", { name: /enviar/i });
     if ((await button.count()) === 0) {
       button = page.locator("button:has-text('Enviar')");
     }
-    await button.first().click({ timeout: timeoutSeconds * 1000 });
-    await page.waitForTimeout(1500);
+    if ((await button.count()) === 0) {
+      throw new Error("Botao Enviar nao encontrado");
+    }
 
     const needle = autorizacaoId ? `/consultas/termo-inss/${autorizacaoId}` : "/consultas/termo-inss/";
-    const ok = calls.some((c) => c.method === "PUT" && c.status >= 200 && c.status < 300 && c.url.includes(needle));
+
+    const putResponsePromise = page
+      .waitForResponse((resp) => resp.request().method() === "PUT" && resp.url().includes(needle), {
+        timeout: timeoutMs,
+      })
+      .catch(() => null);
+
+    await button.first().click({ timeout: Math.min(timeoutMs, 15000) });
+    const putResponse = await putResponsePromise;
+    await page.waitForTimeout(800);
+
+    const putStatus = putResponse ? putResponse.status() : null;
+    const okFromResponse = putStatus != null && putStatus >= 200 && putStatus < 300;
+    const okFromCalls = calls.some((c) => c.method === "PUT" && c.status >= 200 && c.status < 300 && c.url.includes(needle));
+    const ok = okFromResponse || okFromCalls;
+
     await context.close();
-    return { ok, calls };
+    return {
+      ok,
+      calls,
+      putStatus,
+      reason: ok ? null : putStatus == null ? "PUT de aceite nao identificado dentro do timeout" : `PUT retornou status ${putStatus}`,
+    };
   } finally {
     await browser.close();
   }

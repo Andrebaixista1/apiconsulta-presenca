@@ -125,8 +125,42 @@ async function consumeConsultDay({ loginP, senhaP, usedDelta, total = DEFAULT_TO
   }
 }
 
+async function resetStaleConsultDayCounters({ loginP = null, senhaP = null } = {}) {
+  const pool = await getPool();
+  const req = pool.request();
+  req.input("loginP", sql.VarChar(120), loginP ? String(loginP) : null);
+  req.input("senhaP", sql.VarChar(120), senhaP ? String(senhaP) : null);
+
+  const rs = await req.query(`
+    UPDATE [presenca].[dbo].[consult_day]
+    SET
+      [usado] = 0,
+      [restantes] = CASE
+        WHEN [total] IS NULL OR [total] < 0 THEN 0
+        ELSE [total]
+      END,
+      [updated_at] = GETDATE()
+    OUTPUT
+      INSERTED.[id] AS [id],
+      INSERTED.[loginP] AS [loginP],
+      INSERTED.[senhaP] AS [senhaP],
+      DELETED.[usado] AS [usado_anterior],
+      INSERTED.[usado] AS [usado_atual],
+      INSERTED.[restantes] AS [restantes_atual],
+      DELETED.[updated_at] AS [updated_at_anterior],
+      INSERTED.[updated_at] AS [updated_at_atual]
+    WHERE CAST([updated_at] AS DATE) < CAST(GETDATE() AS DATE)
+      AND [usado] > 0
+      AND (@loginP IS NULL OR [loginP] = @loginP)
+      AND (@senhaP IS NULL OR [senhaP] = @senhaP)
+  `);
+
+  return rs.recordset || [];
+}
+
 module.exports = {
   consumeConsultDay,
   DEFAULT_TOTAL_LIMIT,
+  resetStaleConsultDayCounters,
   ConsultDayLimitError,
 };

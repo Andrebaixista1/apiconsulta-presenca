@@ -8,7 +8,13 @@ const {
 const { consumeConsultDay, DEFAULT_TOTAL_LIMIT, ConsultDayLimitError } = require("./consultDayRepo");
 const { saveConsultaPresencaResults, insertPendingConsultaPresenca, getConsultedCpfsTodayByLogin } = require("./consultaPresencaRepo");
 const { createJob, markProgress, markSkipped, finishJob, getJob, getCurrentJob } = require("./statusTracker");
-const { startPendingMonitor } = require("./pendingMonitor");
+const {
+  startPendingMonitor,
+  pausePendingMonitor,
+  resumePendingMonitor,
+  getPendingMonitorState,
+  isPendingMonitorPaused,
+} = require("./pendingMonitor");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -38,9 +44,45 @@ app.get("/api/status/:jobId", (req, res) => {
   return res.json({ ok: true, status });
 });
 
+app.get("/api/consulta/pause-status", (_req, res) => {
+  return res.json({
+    ok: true,
+    monitor: getPendingMonitorState(),
+  });
+});
+
+app.post("/api/consulta/pause", (req, res) => {
+  const reason = String(req.body?.reason || "Pausa manual via API").trim() || "Pausa manual via API";
+  const monitor = pausePendingMonitor(reason);
+  return res.json({
+    ok: true,
+    message: "Processamento de consultas pausado.",
+    monitor,
+  });
+});
+
+app.post("/api/consulta/resume", (_req, res) => {
+  const monitor = resumePendingMonitor();
+  return res.json({
+    ok: true,
+    message: "Processamento de consultas retomado.",
+    monitor,
+  });
+});
+
 app.post("/api/process/individual", async (req, res) => {
   let jobId = null;
   try {
+    if (isPendingMonitorPaused()) {
+      const monitor = getPendingMonitorState();
+      const reason = monitor.reason || "Pausa manual via API";
+      return res.status(423).json({
+        ok: false,
+        error: `Consulta pausada. Motivo: ${reason}`,
+        monitor,
+      });
+    }
+
     const { cpf, nome, telefone, produtoId, autoAcceptHeadless = true, stepDelayMs, login, senha } = req.body || {};
     if (!cpf || !nome || !telefone) {
       return res.status(400).json({ ok: false, error: "Informe cpf, nome e telefone" });
@@ -75,6 +117,8 @@ app.post("/api/process/individual", async (req, res) => {
     const persisted = await saveConsultaPresencaResults([result], {
       loginP: loginValue,
       tipoConsulta: "Individual",
+      status: result.final_status === "OK" ? "Concluido" : "Erro",
+      mensagem: result.final_message,
     });
     finishJob(jobId);
     return res.json({ ok: result.final_status === "OK", jobId, consultDay, persisted, result });

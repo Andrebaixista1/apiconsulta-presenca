@@ -14,51 +14,73 @@ const toVarcharOrNull = (value, max) => {
 };
 
 function buildRowsFromResult(result, loginP, tipoConsulta, options = {}) {
-  const base = {
-    cpf: toBigIntOrNull(result?.cpf),
-    nome: toVarcharOrNull(result?.nome, 100),
-    telefone: toBigIntOrNull(result?.telefone),
-    loginP: toVarcharOrNull(loginP, 50),
-    matricula: toVarcharOrNull(result?.vinculo?.matricula, 255),
-    numeroInscricaoEmpregador: toVarcharOrNull(result?.vinculo?.numeroInscricaoEmpregador, 255),
-    elegivel: result?.vinculo?.elegivel == null ? null : toVarcharOrNull(String(Boolean(result.vinculo.elegivel)), 10),
-    valorMargemDisponivel: toVarcharOrNull(result?.margem_data?.valorMargemDisponivel, 20),
-    valorMargemBase: toVarcharOrNull(result?.margem_data?.valorMargemBase, 20),
-    valorTotalDevido: toVarcharOrNull(result?.margem_data?.valorTotalDevido, 20),
-    dataAdmissao: result?.margem_data?.dataAdmissao || null,
-    dataNascimento: result?.margem_data?.dataNascimento || null,
-    nomeMae: toVarcharOrNull(result?.margem_data?.nomeMae, 100),
-    sexo: toVarcharOrNull(result?.margem_data?.sexo, 2),
-    tipoConsulta: toVarcharOrNull(tipoConsulta || "Individual", 50),
-  };
+  function rowsFromSnapshot(snapshot = {}) {
+    const vinculo = snapshot.vinculo || result?.vinculo || null;
+    const margem = snapshot.margem_data || result?.margem_data || null;
+    const tabelas = Array.isArray(snapshot.tabelas_body)
+      ? snapshot.tabelas_body
+      : Array.isArray(result?.tabelas_body)
+        ? result.tabelas_body
+        : [];
+    const mensagem = snapshot.mensagem ?? result?.final_message;
 
-  const tabelas = Array.isArray(result?.tabelas_body) ? result.tabelas_body : [];
-  if (!tabelas.length) {
-    if (options.skipFallbackRow) return [];
-    return [
-      {
-        ...base,
-        nomeTipo: toVarcharOrNull(null, 150),
-        prazo: null,
-        taxaJuros: toVarcharOrNull(null, 5),
-        valorLiberado: toVarcharOrNull(null, 10),
-        valorParcela: toVarcharOrNull(null, 10),
-        taxaSeguro: toVarcharOrNull(null, 10),
-        valorSeguro: toVarcharOrNull(null, 10),
-      },
-    ];
+    const base = {
+      cpf: toBigIntOrNull(result?.cpf),
+      nome: toVarcharOrNull(result?.nome, 100),
+      telefone: toBigIntOrNull(result?.telefone),
+      loginP: toVarcharOrNull(loginP, 50),
+      matricula: toVarcharOrNull(vinculo?.matricula, 255),
+      numeroInscricaoEmpregador: toVarcharOrNull(vinculo?.numeroInscricaoEmpregador, 255),
+      elegivel: vinculo?.elegivel == null ? null : toVarcharOrNull(String(Boolean(vinculo.elegivel)), 10),
+      valorMargemDisponivel: toVarcharOrNull(margem?.valorMargemDisponivel, 20),
+      valorMargemBase: toVarcharOrNull(margem?.valorMargemBase, 20),
+      valorTotalDevido: toVarcharOrNull(margem?.valorTotalDevido, 20),
+      dataAdmissao: margem?.dataAdmissao || null,
+      dataNascimento: margem?.dataNascimento || null,
+      nomeMae: toVarcharOrNull(margem?.nomeMae, 100),
+      sexo: toVarcharOrNull(margem?.sexo, 2),
+      tipoConsulta: toVarcharOrNull(tipoConsulta || "Individual", 50),
+      mensagem: toVarcharOrNull(mensagem, 1000),
+    };
+
+    if (!tabelas.length) {
+      if (options.skipFallbackRow) return [];
+      return [
+        {
+          ...base,
+          nomeTipo: toVarcharOrNull(null, 150),
+          prazo: null,
+          taxaJuros: toVarcharOrNull(null, 5),
+          valorLiberado: toVarcharOrNull(null, 10),
+          valorParcela: toVarcharOrNull(null, 10),
+          taxaSeguro: toVarcharOrNull(null, 10),
+          valorSeguro: toVarcharOrNull(null, 10),
+        },
+      ];
+    }
+
+    return tabelas.map((t) => ({
+      ...base,
+      nomeTipo: toVarcharOrNull(t?.nome, 150),
+      prazo: t?.prazo ?? null,
+      taxaJuros: toVarcharOrNull(t?.taxaJuros, 5),
+      valorLiberado: toVarcharOrNull(t?.valorLiberado, 10),
+      valorParcela: toVarcharOrNull(t?.valorParcela, 10),
+      taxaSeguro: toVarcharOrNull(t?.taxaSeguro, 10),
+      valorSeguro: toVarcharOrNull(t?.valorSeguro, 10),
+    }));
   }
 
-  return tabelas.map((t) => ({
-    ...base,
-    nomeTipo: toVarcharOrNull(t?.nome, 150),
-    prazo: t?.prazo ?? null,
-    taxaJuros: toVarcharOrNull(t?.taxaJuros, 5),
-    valorLiberado: toVarcharOrNull(t?.valorLiberado, 10),
-    valorParcela: toVarcharOrNull(t?.valorParcela, 10),
-    taxaSeguro: toVarcharOrNull(t?.taxaSeguro, 10),
-    valorSeguro: toVarcharOrNull(t?.valorSeguro, 10),
-  }));
+  const vinculosProcessados = Array.isArray(result?.vinculos_processados) ? result.vinculos_processados : [];
+  if (vinculosProcessados.length) {
+    const rows = [];
+    for (const snapshot of vinculosProcessados) {
+      rows.push(...rowsFromSnapshot(snapshot));
+    }
+    if (rows.length) return rows;
+  }
+
+  return rowsFromSnapshot();
 }
 
 function mapPendingRow(row) {
@@ -113,19 +135,21 @@ async function insertConsultaPresencaRows(rows, options = {}, exec = {}) {
       const createdAtValue = options.createdAt || new Date();
       const updatedAtValue = options.updatedAt || createdAtValue;
       const statusValue = toVarcharOrNull(options.status || "Concluido", 50);
+      const mensagemValue = toVarcharOrNull(row.mensagem ?? options.mensagem, 1000);
       // The table uses SQL Server `datetime` (not datetime2). Use the matching type to avoid precision mismatches.
       req.input("created_at", sql.DateTime, createdAtValue);
       req.input("updated_at", sql.DateTime, updatedAtValue);
       req.input("status", sql.VarChar(50), statusValue);
+      req.input("mensagem", sql.NVarChar(1000), mensagemValue);
 
       await req.query(`
         INSERT INTO [presenca].[dbo].[consulta_presenca]
           ([cpf], [nome], [telefone], [loginP], [created_at], [updated_at], [matricula], [numeroInscricaoEmpregador], [elegivel],
-           [valorMargemDisponivel], [valorMargemBase], [valorTotalDevido], [dataAdmissao], [dataNascimento], [nomeMae], [sexo],
+           [valorMargemDisponivel], [valorMargemBase], [valorTotalDevido], [dataAdmissao], [dataNascimento], [nomeMae], [sexo], [mensagem],
            [nomeTipo], [prazo], [taxaJuros], [valorLiberado], [valorParcela], [taxaSeguro], [valorSeguro], [tipoConsulta], [status])
         VALUES
           (@cpf, @nome, @telefone, @loginP, @created_at, @updated_at, @matricula, @numeroInscricaoEmpregador, @elegivel,
-           @valorMargemDisponivel, @valorMargemBase, @valorTotalDevido, @dataAdmissao, @dataNascimento, @nomeMae, @sexo,
+           @valorMargemDisponivel, @valorMargemBase, @valorTotalDevido, @dataAdmissao, @dataNascimento, @nomeMae, @sexo, @mensagem,
            @nomeTipo, @prazo, @taxaJuros, @valorLiberado, @valorParcela, @taxaSeguro, @valorSeguro, @tipoConsulta, @status)
       `);
       inserted += 1;
@@ -170,7 +194,7 @@ async function listPendingConsultaPresenca(limit = 50) {
       [status]
     FROM [presenca].[dbo].[consulta_presenca] WITH (READPAST)
     WHERE [status] = @status
-    ORDER BY [created_at] ASC, [id] ASC
+    ORDER BY [id] ASC
   `);
   return (rs.recordset || []).map(mapPendingRow);
 }
@@ -233,15 +257,17 @@ async function claimPendingConsultaPresencaById(id) {
   }
 }
 
-async function markConsultaPresencaStatusById(id, status) {
+async function markConsultaPresencaStatusById(id, status, mensagem = null) {
   const pool = await getPool();
   const req = pool.request();
   req.input("id", sql.Int, Number(id));
   req.input("status", sql.VarChar(50), toVarcharOrNull(status, 50));
+  req.input("mensagem", sql.NVarChar(1000), toVarcharOrNull(mensagem, 1000));
   const rs = await req.query(`
     UPDATE [presenca].[dbo].[consulta_presenca]
     SET
       [status] = @status,
+      [mensagem] = COALESCE(@mensagem, [mensagem]),
       [updated_at] = GETDATE()
     WHERE [id] = @id
   `);
@@ -286,34 +312,36 @@ async function updateConsultaPresencaRowById(id, row, options = {}, exec = {}) {
     req.input("valorSeguro", sql.VarChar(10), row.valorSeguro);
     req.input("tipoConsulta", sql.VarChar(50), tipoConsultaValue);
     req.input("status", sql.VarChar(50), statusValue);
+    req.input("mensagem", sql.NVarChar(1000), toVarcharOrNull(row.mensagem ?? options.mensagem, 1000));
 
     const rs = await req.query(`
       UPDATE [presenca].[dbo].[consulta_presenca]
       SET
-        [cpf] = @cpf,
-        [nome] = @nome,
-        [telefone] = @telefone,
-        [loginP] = @loginP,
-        [created_at] = @created_at,
+        [cpf] = COALESCE(@cpf, [cpf]),
+        [nome] = COALESCE(@nome, [nome]),
+        [telefone] = COALESCE(@telefone, [telefone]),
+        [loginP] = COALESCE(@loginP, [loginP]),
+        [created_at] = COALESCE(@created_at, [created_at]),
         [updated_at] = @updated_at,
-        [matricula] = @matricula,
-        [numeroInscricaoEmpregador] = @numeroInscricaoEmpregador,
-        [elegivel] = @elegivel,
-        [valorMargemDisponivel] = @valorMargemDisponivel,
-        [valorMargemBase] = @valorMargemBase,
-        [valorTotalDevido] = @valorTotalDevido,
-        [dataAdmissao] = @dataAdmissao,
-        [dataNascimento] = @dataNascimento,
-        [nomeMae] = @nomeMae,
-        [sexo] = @sexo,
-        [nomeTipo] = @nomeTipo,
-        [prazo] = @prazo,
-        [taxaJuros] = @taxaJuros,
-        [valorLiberado] = @valorLiberado,
-        [valorParcela] = @valorParcela,
-        [taxaSeguro] = @taxaSeguro,
-        [valorSeguro] = @valorSeguro,
-        [tipoConsulta] = @tipoConsulta,
+        [matricula] = COALESCE(@matricula, [matricula]),
+        [numeroInscricaoEmpregador] = COALESCE(@numeroInscricaoEmpregador, [numeroInscricaoEmpregador]),
+        [elegivel] = COALESCE(@elegivel, [elegivel]),
+        [valorMargemDisponivel] = COALESCE(@valorMargemDisponivel, [valorMargemDisponivel]),
+        [valorMargemBase] = COALESCE(@valorMargemBase, [valorMargemBase]),
+        [valorTotalDevido] = COALESCE(@valorTotalDevido, [valorTotalDevido]),
+        [dataAdmissao] = COALESCE(@dataAdmissao, [dataAdmissao]),
+        [dataNascimento] = COALESCE(@dataNascimento, [dataNascimento]),
+        [nomeMae] = COALESCE(@nomeMae, [nomeMae]),
+        [sexo] = COALESCE(@sexo, [sexo]),
+        [nomeTipo] = COALESCE(@nomeTipo, [nomeTipo]),
+        [prazo] = COALESCE(@prazo, [prazo]),
+        [taxaJuros] = COALESCE(@taxaJuros, [taxaJuros]),
+        [valorLiberado] = COALESCE(@valorLiberado, [valorLiberado]),
+        [valorParcela] = COALESCE(@valorParcela, [valorParcela]),
+        [taxaSeguro] = COALESCE(@taxaSeguro, [taxaSeguro]),
+        [valorSeguro] = COALESCE(@valorSeguro, [valorSeguro]),
+        [tipoConsulta] = COALESCE(@tipoConsulta, [tipoConsulta]),
+        [mensagem] = COALESCE(@mensagem, [mensagem]),
         [status] = @status
       WHERE [id] = @id
     `);
@@ -327,10 +355,14 @@ async function updateConsultaPresencaRowById(id, row, options = {}, exec = {}) {
 }
 
 async function replacePendingConsultaPresencaById(pendingRow, results, options = {}) {
+  const effectiveLoginP = toVarcharOrNull(options.loginP || pendingRow?.loginP, 50);
+  const effectiveTipoConsulta = toVarcharOrNull(options.tipoConsulta || pendingRow?.tipoConsulta, 50);
+  const effectiveCreatedAt = options.createdAt || pendingRow.createdAt;
+
   const rows = [];
   for (const result of results || []) {
     rows.push(
-      ...buildRowsFromResult(result, pendingRow?.loginP, pendingRow?.tipoConsulta, {
+      ...buildRowsFromResult(result, effectiveLoginP, effectiveTipoConsulta, {
         skipFallbackRow: options.skipFallbackRow,
       })
     );
@@ -346,9 +378,10 @@ async function replacePendingConsultaPresencaById(pendingRow, results, options =
     let updatedRows = 0;
     let insertedRows = 0;
     const baseOptions = {
-      loginP: pendingRow.loginP,
-      tipoConsulta: pendingRow.tipoConsulta,
-      createdAt: pendingRow.createdAt,
+      loginP: effectiveLoginP,
+      tipoConsulta: effectiveTipoConsulta,
+      createdAt: effectiveCreatedAt,
+      mensagem: toVarcharOrNull(options.mensagem, 1000),
       status: options.status || "Concluido",
     };
 
@@ -363,11 +396,15 @@ async function replacePendingConsultaPresencaById(pendingRow, results, options =
     } else {
       const upd = new sql.Request(tx);
       upd.input("id", sql.Int, Number(pendingRow.id));
+      upd.input("loginP", sql.VarChar(50), effectiveLoginP);
       upd.input("status", sql.VarChar(50), toVarcharOrNull(options.status || "Concluido", 50));
+      upd.input("mensagem", sql.NVarChar(1000), toVarcharOrNull(options.mensagem, 1000));
       const rs = await upd.query(`
         UPDATE [presenca].[dbo].[consulta_presenca]
         SET
+          [loginP] = COALESCE(@loginP, [loginP]),
           [status] = @status,
+          [mensagem] = COALESCE(@mensagem, [mensagem]),
           [updated_at] = GETDATE()
         WHERE [id] = @id
       `);
@@ -382,7 +419,7 @@ async function replacePendingConsultaPresencaById(pendingRow, results, options =
   }
 }
 
-async function saveConsultaPresencaResults(results, { loginP, tipoConsulta, createdAt, status } = {}) {
+async function saveConsultaPresencaResults(results, { loginP, tipoConsulta, createdAt, status, mensagem } = {}) {
   const rows = [];
   for (const result of results || []) {
     rows.push(...buildRowsFromResult(result, loginP, tipoConsulta));
@@ -414,7 +451,7 @@ async function saveConsultaPresencaResults(results, { loginP, tipoConsulta, crea
 
     const insertedRows = await insertConsultaPresencaRows(
       validRows,
-      { loginP: loginPValue, tipoConsulta: tipoConsultaValue, createdAt: createdAtValue, status },
+      { loginP: loginPValue, tipoConsulta: tipoConsultaValue, createdAt: createdAtValue, status, mensagem },
       { tx }
     );
 
